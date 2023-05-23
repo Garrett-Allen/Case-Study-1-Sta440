@@ -1,0 +1,585 @@
+---
+title: "Explaining Loan Default in Microfinance"
+subtitle: "Garrett Allen, Piper Hampsch, and Boxuan Li (4:45 Runtime)"
+format: pdf
+editor: visual
+fontsize: 11pt
+execute:
+  echo: false
+---
+
+```{r load-packages}
+#| message: false
+#| warning: false
+
+# define packages to install
+packages <- c('tidyverse', 'dplyr', 'patchwork', 'kableExtra', 'retuculate', 'sf',
+              'broom', 'pROC', 'yardstick', 'survival', 'ggsurvfit', 'lme4',
+              'rgdal', 'survival', 'rms', 'pec', 'survminer')
+
+# install all packages that are not already installed
+install.packages(setdiff(packages, rownames(installed.packages())), repos = "http://cran.us.r-project.org")
+
+library(tidyverse)
+library(dplyr)
+library(patchwork)
+library(kableExtra)
+library(reticulate)
+library(sf)
+library(broom)
+library(pROC)
+library(yardstick)
+library(survival)
+library(ggsurvfit)
+library(lme4)
+library(rgdal)
+library(survival)
+library(rms)
+library(pec)
+library(survminer)
+```
+
+```{r load-data}
+#| message: false
+#| warning: false
+loan_repayments <- read_csv("../instructor_data/loan_repayments.csv")
+loan_schedule <- read_csv("../instructor_data/loan_schedule.csv")
+loans_clean <- read_csv("../instructor_data/loans_clean.csv")
+lenders_clean <- read_csv("../instructor_data/lenders_clean.csv")
+country_cont <- read_csv("Countries-Continents.csv")
+
+my_spdf <- st_as_sf(readOGR( 
+  dsn= "world_shape_file/" , 
+  layer="TM_WORLD_BORDERS_SIMPL-0.3",
+  verbose=FALSE
+))
+```
+
+# Introduction
+
+We aim to analyze loan data from the San Francisco based microfinance institution, Kiva. We rely on the Kiva database which provides a collection of information on a random sample of loans from 2005-2012 to explore the factors influencing loan default. Each loan issued to low-income individuals is connected to online lenders with a peer-to-peer investment model. Diving into this loan data will provide more context on the sustainability of Kiva's model and the future of its lending model.
+
+We will discuss our data cleaning process, defining what is considered default in the dataset and which sociodemographic and geographic factors we expect to contribute to risk of default. We will explore the data visually to inform our modeling process, followed by a thorough exploration of models for both risk of default and time to default. We hope to use the exploratory data analysis and model output to make conclusions on which sociodemographic and geographic factors (from both the borrower and lender) contribute to risk of default, with which we hope to provide actionable insight to potential investors in Kiva.
+
+# Methodology
+
+```{r data-cleaning-ph-1}
+# create loan repayment copy and combine dates
+loan_repayments_copy <- loan_repayments %>% 
+  mutate(Processed_Date = as.Date(paste(processed_yr, processed_mo, processed_day, sep="-"),
+                                  "%Y-%m-%d"),
+         Settlement_Date = as.Date(paste(settlement_yr, settlement_mo, settlement_day, sep="-"),
+                                   "%Y-%m-%d"))
+
+# get first and last loan repayment
+loan_repayments_info = loan_repayments_copy %>% 
+    group_by(loan_id) %>% 
+    summarise(firstocc = first(Processed_Date), lastocc = last(Processed_Date)) %>% 
+  rename(First_Payment_Processed_Date=firstocc,
+         Last_Payment_Processed_Date=lastocc)
+
+# merge loan data
+loan_merged <- merge(loan_repayments_info, loans_clean, by = "loan_id",
+                  all.x = TRUE) %>%
+  mutate(Posted_Date = as.Date
+         (paste(
+           posted_yr, 
+           posted_mo, 
+           posted_day, 
+           sep="-"),
+           "%Y-%m-%d"),
+         terms.disbursal_Date = as.Date(
+           paste(
+             terms.disbursal_yr, 
+             terms.disbursal_mo,
+             terms.disbursal_day, 
+             sep="-"),
+           "%Y-%m-%d"),
+         funded_Date = as.Date(paste(funded_yr, funded_mo, funded_day,sep="-"),"%Y-%m-%d"),
+         paid_Date = as.Date(paste(paid_yr,paid_mo,paid_day,sep="-"),"%Y-%m-%d"),
+         planned_expiration_Date = as.Date(paste(planned_expiration_yr, planned_expiration_mo,
+                                                              planned_expiration_day, sep="-"),
+                                           "%Y-%m-%d")) %>% 
+  mutate(time_elapsed = as.numeric(Last_Payment_Processed_Date - First_Payment_Processed_Date)) %>% 
+  mutate(default = as.numeric(if_else(status == "defaulted", 1, 0))) %>% 
+  mutate(default = if_else(status %in% c("paid","defaulted"),default,as.numeric(NA))) %>% 
+  left_join(country_cont, by = c("location.country" = "Country")) %>% 
+  mutate(description = case_when(description.en == TRUE ~ "english",
+                                 description.fr == TRUE ~ "french",
+                                 description.es == TRUE ~ "spanish",
+                                 description.vi == TRUE ~ "vietnamese",
+                                 description.id == TRUE ~ "indonesian",
+                                 description.pt == TRUE ~ "portuguese",
+                                 description.ar == TRUE ~ "arabic",
+                                 description.ru == TRUE ~ "russian",
+                                 TRUE ~ "no_desc")
+         ) %>% 
+  mutate(amount_per_person = payments.dollar_total / borrower_count,
+         single_borrower = if_else(borrower_count == 1, TRUE, FALSE),
+         maj_female_borrower = if_else(borrower_f_count > borrower_m_count, TRUE, FALSE)
+  )
+```
+
+In order to understand what factors contribute to risk of default and time to default, we must first define default from the data available from Kiva. Though each loan has an assigned status, there are nuances between defaulted loans and paid loans that require further attention in defining default.
+
+```{r EDA-status}
+#| fig-align: center
+#| fig-pos: 'H'
+## display status labels with counts
+## included in narrative, hiding the table
+# loan_merged %>% 
+#   group_by(status) %>% 
+#   summarize(count = n()) %>% 
+#   kable(booktabs = T)
+```
+
+With our definition of default for this analysis, we hope to separate these labels into binary options: defaulted or not defaulted. After reading through Kiva's documentation on the status of loans, we will remove observations with statuses of expired, funded, fundraising, inactive, and refunded due to their smaller sample sizes and that these statuses do not have a clear binary option between defaulted and not defaulted. Loans in repayment require further separation, and we will see how these loans align with their loan schedule in determining their risk of defaulting.
+
+```{r data-cleaning-ph-2}
+# filter ambiguous status labels
+# create binary response variable for loan default
+loan_merged <- loan_merged %>% 
+  filter(!status %in% c("expired", "funded", "fundraising", "inactive", "refunded")) %>% 
+  mutate(default = as.factor(case_when(status == "defaulted" ~ TRUE,
+                             status == "in_repayment" ~ NA,
+                             TRUE ~ FALSE)
+         ))
+```
+
+## Exploratory data analysis
+
+With the newly-defined variable for loan default, we can proceed with some exploratory data analysis on the response variable and potential predictors in the loans dataset. These visualizations will help inform the components of our model later on in the analysis.
+
+```{r resp-EDA}
+#| fig-align: center
+#| warning: false
+# display defaulted proportions
+t1 <- prop.table(table(loan_merged$default)) %>% 
+  kable(col.names = c("Defaulted?", "Proportion"), booktabs = T)
+
+# default status by geographic location
+world <- map_data("world")
+m1 <- loan_merged %>% 
+  filter(!is.na(default)) %>%
+  st_as_sf(coords = c('lon', 'lat')) %>% 
+  ggplot() +
+  geom_map(data = world, map = world,
+           aes(long, lat, map_id = region)) +
+  geom_sf(aes(color = default), alpha = 0.1) +
+  labs(x = "longitude", y = "latitude", title = "Loan Default Status Geographically") + 
+  theme_bw()
+
+# output visualizations
+# (omitting proportion table for now)
+# m1
+```
+
+```{r main-EDA-1}
+#| warning: false
+# boxplots for predictors vs default
+b1 <- loan_merged %>%
+  group_by(default) %>% 
+  ggplot(aes(x = default, y = loan_amount)) + 
+  geom_boxplot() + 
+  theme_bw() + 
+  labs(title = "Loan Amount vs Default Status",
+       x = "Default",
+       y = "Value")
+
+b2 <- loan_merged %>% 
+  group_by(Continent) %>% 
+  count(default) %>% 
+  mutate(percent_default = n / sum(n)) %>% 
+  slice(2) %>% 
+  ggplot(aes(x = Continent, y = percent_default)) + 
+  geom_col() + 
+  theme_bw() + 
+  labs(x = "Continent",
+       y = "Percent Defaulted",
+       title = "Percent Default Across Continents")
+
+b3 <- loan_merged %>% 
+  group_by(single_borrower) %>% 
+  count(default) %>% 
+  mutate(percent_default = n / sum(n)) %>% 
+  slice(2) %>% 
+  ggplot(aes(x = single_borrower, y = percent_default)) + 
+  geom_col() + 
+  theme_bw() + 
+  labs(x = "Single Borrower",
+       y = "Percent Defaulted",
+       title = "Single Borrower vs Default Status")
+```
+
+```{r main-EDA-out}
+#| message: false
+#| warning: false
+#| fig-align: center
+#| fig-width: 8
+#| fig-height: 5
+(b1 + b3) / b2
+```
+
+## Modeling Loan Default Status
+
+It would be useful to Kiva's stakeholders to be able to predict whether a given loan will result in a default, allowing Kiva to advise borrowers on which loans are high risk. Kiva would become a better platform for investors who are concerned about losing their money. In order to explore this question, we will fit a logistic regression model that predicts the default status of a loan given various sociodemographic characteristics.
+
+Each of our covariates has a good justification for adding it to the model. Our initial data analysis suggested that there may is a geographic correlation with probability of default, so we added continent to our model. We did not include country because it would add nearly 40 terms to the model, it ran the risk of overfitting, and continent worked similarly as well in predictive performance.  The total loan amount seemed reasonable given that they directly relate to how a loan becomes paid off, and our EDA suggested differences in total loan amount between defaulted and non-defaulted loans. Our single borrower variable indicates whether or not the loan was given to a group of borrowers, or just one; this was added because it seems likely that a group of borrowers might be better at paying off a loan than just one. Type of geographic area also seemed reasonable to add, as our EDA showed that only defaulted loans are only in the country (as opposed to towns) making it a powerful predictor in our model for identifying true negatives.
+
+There were some variables that, while they would have made the model perform better,
+we did not include because borrowers would not have access to them at the time of the loan (i.e. number of payments made on a loan, total payments made, etc.). We also found that the gender of the borrower was not a good separator of the data, even when considering how gender may interact with other variables in the model, like continent. Sector also was not a useful variable in the EDA, as the probability of default was similar within each sector. Interaction effects between the variables included were considered, but they did not help predictive performance and raised the AIC, so we omitted interaction terms from the model.
+
+### Modeling Loan Default
+
+With all of this setup, we fit a logistic regression model using all of these covariates, with no interaction effects, to predict whether a loan is paid or in default. In repayment loans will not be addressed in this analysis, and they will be removed while fitting this model. In the next section, we will describe our methodology and assess model fit. In our results section, we will discuss how to interpret our coefficients, and in our discussion section, we will discuss implications of our model for which loans are likely to result in default.
+
+
+```{r model fitting}
+#| message: false
+#| warning: false
+#| echo: false
+set.seed(123)
+
+loan_merged <- loan_merged %>% 
+  filter(!is.na(default))
+
+train <- loan_merged %>% 
+  slice_sample(prop = .8)
+
+test <- anti_join(loan_merged, train, by = "loan_id")
+
+model <- glm(default ~
+               Continent + 
+               location.geo.level + 
+               single_borrower +
+               loan_amount,
+                   data = train, 
+                   family = "binomial")
+```
+
+Most of our coefficients have significant p-values, indicating that we can interpret their effects as significantly correlated with probability of a loan default. Backwards selection indicating that this model has the lowest AIC out of models with these covariates as the full model, and everything appears to be normal when looking at the coefficient output. VIF of all the covariates is low, with the worst VIF being 1.6. This is well below 5, so this is not particularly concerning.
+
+Now that we have fit our model and no immediate issues seem apparent, we will perform model diagnostics on our model.
+
+```{r model output}
+#| message: false
+#| warning: false
+#| echo: false
+model %>%
+  tidy(conf.int = TRUE, exponentiate = TRUE) %>% 
+  select(term, estimate, std.error, 
+         p.value, conf.low, conf.high) %>% 
+  kable(digits = 4)
+```
+
+### Model Diagnostics
+
+In this section, we will assess how well our model does predicting the default status of our loans. We broke up the data into a testing and training set with an 80-20 split, and we assessed how well the model performed using common logistic regression metrics like ROC curves, AUC, and PRC curves.
+
+The AUC is around 90% for the training set and 89% for the testing set, which is quite high, and the deviance residual plot looks exactly like one would expect for a logistic regression model of this type. It has a clear pattern indicating the classes, with the residuals for the default class getting smaller as fitted probability grows, and residuals for the paid in full class getting smaller as fitted probability goes to 0. The ROC curves look very good for both the training and testing set, and same with the PR curves.
+
+In short, the model appears to be performing moderately well on both the training and testing set. Sensitivity, recall, and precision are all moderately high, and our model appears to be performing better than random chance.
+
+```{r model evaluation}
+#| message: false
+#| warning: false
+#| echo: false
+#| fig-align: center
+#| fig-width: 8
+#| fig-height: 5
+model_comb <- bind_rows(
+  broom::augment(model,
+                 type.predict = "response") %>% 
+    mutate(model = "training_set"),
+  broom::augment(model, 
+                 newdata = test,
+                 type.predict = "response") %>% 
+  mutate(model = "testing_set")
+)
+  
+roc_curve <- model_comb %>% 
+  group_by(model) %>% 
+  roc_curve(default, .fitted, event_level = "second") %>% 
+  autoplot() + 
+  labs(title = "ROC Curve")
+
+deviance_residual_plot <- model_comb %>% 
+  ggplot(aes(x = .fitted, y = .resid)) + 
+  geom_point() + 
+  theme_bw() + 
+  labs(x = "Fitted Probabilities",
+       y = "Residuals",
+       title = "Deviance Residual Plot for Logistic Model")
+
+pr_curve <- model_comb %>% 
+  group_by(model) %>% 
+  select(default, .fitted) %>% 
+  pr_curve(truth = default, .fitted) %>% 
+  autoplot() + 
+  labs(title = "Precision-Recall") 
+
+roc_auc <- model_comb %>% 
+  group_by(model) %>% 
+  roc_auc(default,.fitted, event_level = "second")
+
+threshold_value <- model_comb %>% 
+  filter(model == "training_set") %>% 
+  roc(default, .fitted) %>% 
+  coords("best", ret = "threshold") %>% 
+  pull()
+
+best_threshold <- model_comb %>% 
+  roc_curve(default,.fitted) %>% 
+  filter(.threshold < threshold_value) %>% 
+  arrange(desc(.threshold)) %>% 
+  slice(1) %>% 
+  pull(.threshold)
+
+pr_auc <- model_comb %>% 
+  group_by(model) %>% 
+  pr_auc(default, .fitted)
+
+pr_curve <- model_comb %>% 
+  group_by(model) %>% 
+  select(default, .fitted) %>% 
+  pr_curve(truth = default, .fitted) %>% 
+  autoplot() + 
+  labs(title = "Precision-Recall Curve of Model")
+
+diagnostics_plot <- (roc_curve + pr_curve) / (deviance_residual_plot )
+diagnostics_plot
+```
+
+```{r tp/fp with threshold at best threshold}
+#| message: false
+#| warning: false
+#| echo: false
+#| fig-align: center
+model_comb %>% 
+  filter(model == "testing_set") %>% 
+  group_by(default) %>% 
+  mutate(predict = .fitted > best_threshold)  %>% 
+  select(default, .fitted, predict) %>% 
+  count(predict) %>% 
+  ungroup() %>% 
+  mutate(type = c("true negative",
+                  "false positive",
+                  "false negative",
+                  "true positive")) %>% 
+  select(n, type) %>% 
+  kable(booktabs = T)
+```
+
+Above, we have have a table that shows the true positives, false positives, true negatives, and false negatives when the threshold for classifying a loan as defaulted is set at the best threshold (.03728), as determined by the ROC curve. We can see that our model is not performing very well, and that while it struggles with identifying true positives, the false negative rate isn't too bad, with around 18% of our truly positive defaulted loans in the test data set being classified as negative. Our model is doing significantly better than random chance, and thus we feel confident that we can interpret our model coefficients as being meaningful. We will give results on how to interpret the logistic regression in the results section of the paper.
+
+## Modeling survival time
+
+We pre-determined several factors that may affect the time and probability to default and processed the data as follows:
+
+1.  We calculate the survival time as the total amount of time the borrower has been keeping up with the payments, calculated as the last payment processed date (roughly the time the borrower makes a payment) subtracted by the the first payment processed date.
+2.  We calculate the total number of days the loans get scheduled to be paid in full by the subtracting the first payment date from the last.
+3.  We calculate the percentage of the loan was paid by the borrower's last recorded payment (censored or failed). For borrowers who are paid, this value is 100%.
+4.  We calculate the percentage of time the borrower has been keeping up with the payment by dividing the borrower's total time of making the payment by the total amount of time for the loan to be paid. Note this value could be larger than one since some borrowers made their last payment after the due date of the loan.
+
+For borrowers who have paid their loan, we know this borrower would not default through out the time span of the study, or the dataset. Hence, we set the last payment date of all borrowers who have paid in full to be 2012-03-02, one day after the last data was collected.
+
+```{r data-cleaning-bl}
+#| message: false
+#| warning: false
+#| echo: false
+
+# copy loan repayments
+loan_repayments_copy <- loan_repayments
+loan_repayments_copy$Processed_Date<-as.Date(with(loan_repayments_copy,paste(processed_yr,processed_mo,processed_day,sep="-")),"%Y-%m-%d")
+loan_repayments_copy$Settlement_Date<-as.Date(with(loan_repayments_copy,paste(settlement_yr,settlement_mo,settlement_day,sep="-")),"%Y-%m-%d")
+loan_repayments_copy=loan_repayments_copy[c("loan_id", "amount","local_amount","rounded_local_amount","currency_exchange_loss_amount","payment_id","Processed_Date","Settlement_Date" )]
+
+# copy loan schedule
+loan_schedule_copy<-loan_schedule
+loan_schedule_copy$Loan_due_Date<-as.Date(with(loan_schedule_copy,paste(scheduled_payments.due_yr,scheduled_payments.due_mo,scheduled_payments.due_day,sep="-")),"%Y-%m-%d")
+
+# Get the first and last payment time
+loan_repayments_info=loan_repayments_copy %>% 
+    group_by(loan_id) %>%
+    summarise(firstocc = first(Processed_Date), lastocc = last(Processed_Date))
+# Rename variables
+loan_repayments_info=loan_repayments_info %>% 
+  rename(
+    First_Payment_Processed_Date=firstocc,
+    Last_Payment_Processed_Date=lastocc
+    )
+
+# Get the first and last scheduled payment time
+loan_due_dates_info=loan_schedule_copy %>% 
+    group_by(loan_id) %>%
+    summarise(firstocc = first(Loan_due_Date), lastocc = last(Loan_due_Date))
+# Rename variables
+loan_due_dates_info=loan_due_dates_info %>% 
+  rename(
+    First_due_dates_Date=firstocc,
+    Last_due_dates_Date=lastocc
+    )
+country_cont_new=country_cont %>% 
+  rename(
+    location.country=Country
+    )
+
+# Join three datasets together
+loan_merged <- merge(loans_clean, country_cont_new, by = "location.country",
+                  all.x = TRUE)
+loan_merged <- merge(loan_due_dates_info, loan_merged, by = "loan_id",
+                  all.x = TRUE)
+loan_merged <- merge(loan_repayments_info, loan_merged, by = "loan_id",
+                  all.x = TRUE)
+
+# Consider only defaulted, paid, and in_repayment
+loan_merged=loan_merged[loan_merged$status %in% c('defaulted','paid','in_repayment'),]
+
+# Calculate the total time span for the borrower to pay in full
+loan_merged$payment_len_scheduled<- as.numeric(difftime(loan_merged$Last_due_dates_Date,loan_merged$First_due_dates_Date,units = "days"))
+
+# Calculate how long the borrower has been paying
+loan_merged$time_to_default <- as.numeric(difftime(loan_merged$Last_Payment_Processed_Date,loan_merged$First_Payment_Processed_Date,units = "days")) 
+
+# Percentage of time of the borrower has been keeping up with the payment
+loan_merged$time_percent=loan_merged$time_to_default/loan_merged$payment_len_scheduled
+
+# Drop inf (in rare cases, payment_len_scheduled is 0)
+loan_merged <- loan_merged[!is.infinite(loan_merged$time_percent),]
+
+loan_merged$Posted_Date<-as.Date(with(loan_merged,paste(posted_yr,posted_mo,posted_day,sep="-")),"%Y-%m-%d")
+loan_merged$terms.disbursal_Date<-as.Date(with(loan_merged,paste(terms.disbursal_yr,terms.disbursal_mo,terms.disbursal_day,sep="-")),"%Y-%m-%d")
+loan_merged$funded_Date<-as.Date(with(loan_merged,paste(funded_yr,funded_mo,funded_day,sep="-")),"%Y-%m-%d")
+loan_merged$paid_Date<-as.Date(with(loan_merged,paste(paid_yr,paid_mo,paid_day,sep="-")),"%Y-%m-%d")
+loan_merged[["paid_amount"]][is.na(loan_merged[["paid_amount"]])] <- 0 
+
+# Calculate the percentage of fund has been paid
+loan_merged$paid_percentage=loan_merged$paid_amount/loan_merged$funded_amount
+loan_merged$Last_Payment_Processed_Date[loan_merged$status=='paid']<- as.Date('2012-03-02',"%Y-%m-%d")
+
+# Select features of interest, feel free to use other features
+loan_merged_new<-loan_merged %>%
+  select(status, loan_amount, sector,location.geo.level,terms.loss_liability.nonpayment,Last_Payment_Processed_Date,First_Payment_Processed_Date,paid_percentage,payment_len_scheduled,time_percent,borrower_count,Continent)
+
+loan_merged_new<-loan_merged %>%
+  select(status, loan_amount, sector,location.geo.level,terms.loss_liability.nonpayment,Last_Payment_Processed_Date,First_Payment_Processed_Date,paid_percentage,payment_len_scheduled,time_percent,borrower_count,Continent,payments.count)
+
+loan_merged_new <- loan_merged_new %>%
+  mutate(time_to_default = as.numeric(difftime(Last_Payment_Processed_Date,First_Payment_Processed_Date,units = "days")))
+loan_merged_new$s_status <- with(
+  loan_merged_new,ifelse(status=='defaulted',1,0)
+)
+loan_merged_new<-na.omit(loan_merged_new)
+
+loan_merged_train_1<-loan_merged_new %>%
+  select(s_status, time_to_default,loan_amount, sector,location.geo.level,terms.loss_liability.nonpayment,paid_percentage,borrower_count,payment_len_scheduled,payments.count,time_percent,Continent)
+
+loan_merged_new_2<-loan_merged_new %>%
+  select(s_status, time_to_default,loan_amount, sector,location.geo.level,terms.loss_liability.nonpayment,paid_percentage,borrower_count,payment_len_scheduled,payments.count,time_percent,Continent)
+```
+
+
+We fit a cox proportional hazard model using backward selection under a selection criteria  of AIC. After elimination, the final model with the smallest AIC includes covariates of sector, geo-level location, nonrepayment loss and liability, borrower count, payment length schedule, payments count, continent, and time percent.
+
+```{r}
+surv_obj <- Surv(loan_merged_train_1$time_to_default,loan_merged_train_1$s_status)
+f <- selectCox(surv_obj ~ sector + location.geo.level + 
+                 terms.loss_liability.nonpayment + borrower_count + 
+                 payment_len_scheduled + payments.count + Continent + 
+                 time_percent, data = loan_merged_train_1, rule = "aic")
+```
+
+We first checked for linearity of the continuous/ordinal covariates. The continuous/ordinal covariates are payment length schedule, borrower count, and payments count. We plotted these covariates against martingale residuals of the null Cox proportional hazards model. From the plots, we saw that the linear relationship generally holds between the hazard and the log of payments count. We modified the model to include this. Since the linearity assumption does not hold for payment length schedule and borrower count, neither for the log of these covariates, we will drop them in the final model. We then checked the proportional hazard using the log-log curves. Due to page limitation, we could not show them in this report, but we created log-log visualizations for continent and sector.
+
+```{r}
+#| warning: false
+#| message: false
+#| fig-height: 4
+#| fig-width: 5
+
+# ggcoxfunctional(Surv(loan_merged_train_1$time_to_default,loan_merged_train_1$s_status)~  payments.count + log(payments.count )
+#     , data = loan_merged_train_1)
+```
+
+```{r}
+#| warning: false
+#| message: false
+#| fig-height: 3
+#| fig-width: 5
+km_sector <- survfit(Surv(loan_merged_train_1$time_to_default,loan_merged_train_1$s_status) ~ sector, data = loan_merged_train_1)
+#plot(km_sector, fun = "cloglog", xlab = "Time (in days) using log",
+#           ylab = "log-log survival")
+```
+
+Next, we check for proportional hazards assumption through survival curves. The lines are roughly parallel, so the assumption of proportional hazards generally appears to hold. Our final model is fitted with covariates of sector, geo-level location, nonrepayment loss and liability, borrower count, log-tranformed payments count, and continent. After eliminating the insignificant terms, the final model and its coefficient estimates are given by: 
+
+```{r}
+fit <- cph(Surv(loan_merged_train_1$time_to_default,loan_merged_train_1$s_status)~ sector + location.geo.level + 
+    terms.loss_liability.nonpayment + log(payments.count) + Continent,data = loan_merged_train_1)
+```
+
+```{r}
+# table output
+tab <- matrix(c("log(payments.count)", -0.9603,
+"terms.loss_liability.nonpayment=partner", -8.3906,
+"location.geo.level=town", -0.4323,
+"sector=Clothing", -0.5826,
+"sector=Construction", -0.4417,
+"sector=Food", -0.6545,
+"sector=Retail", -0.8433,
+"sector=Transportation", -1.4586,
+"sector=Wholesale", -1.4744), ncol=2, byrow=TRUE)
+colnames(tab) <- c('term','estimate')
+rownames(tab) <- c('', '', '', '', '', '', '', '', '')
+as.table(tab) %>% kable(booktabs = T)
+```
+
+To help inform potential investors by estimating the probability of default, we use the Kaplan Meier estimate to calculate the survival curve, given by $S(t)=\Pi_{i:t_i \leq t}(1-\frac{D_i}{N_i})=\Pi_{i:t_i \leq t}\frac{S_i}{N_i}$. The survival curve is as follows. We can see most of the borrowers keep paying their loans. We present the 95% confidence interval and number of defaulted borrowers and those who are at risk as time passes. We also print out the risk of being default every half a year after the first payment.
+
+```{r survival model fitting 2}
+#| message: false
+#| warning: false
+#| fig-height: 2
+# Fit kaplan meier
+surv_obj <- Surv(loan_merged_train_1$time_to_default,loan_merged_train_1$s_status)
+fit=survfit(surv_obj~1,data = loan_merged_train_1)
+# Plot
+ggsurvfit(fit)+
+  labs(
+  x = "Days",
+  y = "Overall Survival Probability"
+ )+
+  add_confidence_interval()
+  #add_risktable()+xlim(0, 2100)
+
+# Checks P_survival
+# summary(fit, times = c(1,180*(1:15)))
+```
+
+# Results
+
+## Results for Modeling Loan Default Status
+
+For our continents variable, our baseline level was Africa, which every other continent had lower odds of defaulting than, as the sign of the coefficients on the log odds is negative. For example, the odds of defaulting in Asia compared to Africa with all other variables held constant decreased by a factor of .19, which is a rather large difference. Europe, South America, and Asia all had significant p-values at the .05 level, which suggests that the continent is correlated with the probability of default; lenders should broadly pay attention to the geographic location of where they are lending.
+
+Being in a town as compared to the country resulted in default being much less likely; the odds of default decreased by a factor of of less than .0001, all else held constant. In fact, rather strangely, all of the defaults in our dataset here are in the country, making this by far the most important predictor of defaulting. This may suggest some sort of error with the dataset provided, as this seems unreasonable, but based on the data we have provided, type of geographic area was strongly correlated with probability of default. Thus, lending in towns appears to be significantly less risky than lending in the country.
+
+Being a single borrower significantly raises the odds of default; specifically, being a single borrower raised the odds of default by 1.6, all else held constant. This suggests that being a single borrower is correlated with default, so lenders should pay attention to this variable when lending. 
+
+Each 1 dollar increase in the loan amount results in a slightly decreased odds of default, as the odds of default decreased by a factor of .9999. This effect does not appear to be as significant as the rest of the variables, but broadly suggests that more expensive loans may be correlated with lower default odds. This result should be interpreted cautiously; it may be that higher loan amounts are only funded when lenders think that the loans are more likely to not default, resulting in a selection bias in our dataset. 
+
+## Results for Modeling Survival Analysis
+
+For our model, our baseline for continent is Africa, nonrepayment loss and liability is lender, geo-level location is country, and sector is Agriculture.
+
+For the Continent covariate, we can see that borrowers in most other continents have a smaller the hazard to default. For lenders in North America, the log hazard rate decrease by a factor of 0.5351, or have approximately 0.586 (exp(-0.5351)) times the hazard of in Africa, holding everything else constant. In South America, the hazard is 0.388 times that in Africa, and in Asia, 0.174 (exp(-1.7481) and in Europe, 0.015 (exp(-4.2252)) as the hazard in Africa, holding everything constant. For borrowers in Oceania, the p-value of the coefficient is not significant at 0.05 level. We also find a difference between sectors. For if the borrowed money is used for Clothing, Construction, Food, Transportation, and Wholesale, the corresponding hazard of default is 0.649, 0.558, 0.643, 0.520, and 0.430 of the hazard being in Agriculture, holding everything else constant. If the loss liability is the partner, the hazard is 0.382 of the hazard if the loss liability is the lender, and most notably, if the borrower lives in town, the hazard is only 0.0002 of that of the borrower lives in the countryside. If the log(payments.count) increase by one unit than another, the hazard will be 0.454 times of the hazard of the event than the other. For the rest of the coefficients, they are not significant at 0.05 level so we did not include them.
+
+# Discussion
+
+Though we lay a foundation for analyzing loan default for Kiva, we identified some limitations to our work and possibilities for future work. In our logistic regression model, we intended to explore more recent data in the Kiva API so that we could pull in new information in light of the censored data. This would have allowed us to see if our logistic regression model performed well against newer loan data. Future work could carry out this intention and provide an in-depth model evaluation procedure with actual data from the Kiva API. We also considered exploring possible distributions for survival time, since we assumed it to be logistic in our analysis. Most of the coefficients were not significant for the survival model, so future work may look to explore the underlying distribution and consider more covariates in the model.
+
+# References
+
+*How does kiva work?* Kiva. (n.d.). Retrieved January 20, 2023, from <https://www.kiva.org/about/how>
+
+Bouquin, Daina. IS 608, (2016), GitHub repository, Retrieved January 22, 2023, from <https://github.com/charlespwd/project-title>
